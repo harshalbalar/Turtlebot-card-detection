@@ -2,14 +2,12 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
-from geometry_msgs.msg import Twist  # NEW: For moving the wheels!
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import pytesseract
 import math
-import time # NEW: For timers
+import time
 
 # --- Helper Functions ---
 def order_points(pts):
@@ -32,40 +30,57 @@ def get_warped_card(frame, pts, width=200, height=300):
     return cv2.warpPerspective(frame, M, (width, height))
 
 def read_card_identity(warped_bgr):
-    corner = warped_bgr[5:85, 5:45]
+    corner = warped_bgr[5:95, 5:55]
     hsv_corner = cv2.cvtColor(corner, cv2.COLOR_BGR2HSV)
     lower_red1, upper_red1 = np.array([0, 70, 50]), np.array([10, 255, 255])
     lower_red2, upper_red2 = np.array([170, 70, 50]), np.array([180, 255, 255])
-    mask1 = cv2.inRange(hsv_corner, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv_corner, lower_red2, upper_red2)
-    red_mask = mask1 + mask2
-    color_str = "Red" if cv2.countNonZero(red_mask) > 50 else "Black"
+    red_mask = cv2.inRange(hsv_corner, lower_red1, upper_red1) + cv2.inRange(hsv_corner, lower_red2, upper_red2)
+    color_str = "Red" if cv2.countNonZero(red_mask) > 100 else "Black"
 
-    gray_corner = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray_corner, 150, 255, cv2.THRESH_BINARY_INV)
-    custom_config = r'--psm 10 -c tessedit_char_whitelist=2345678910JQKA'
+    number_only_crop = corner[0:60, 0:45]
+    gray_corner = cv2.cvtColor(number_only_crop, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray_corner, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh = cv2.resize(thresh, (0, 0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+
+    custom_config = r'--psm 8 -c tessedit_char_whitelist=2345678910JQKA'
     rank = pytesseract.image_to_string(thresh, config=custom_config).strip()
+    if len(rank) > 2 and rank != "10": rank = rank[0] 
     if not rank: rank = "?"
     return f"{rank} of {color_str}"
 
-def check_flip_angle(mem_card_gray, cur_card_gray):
+# NEW: Supercharged Memory Search Engine
+def find_best_match_and_angle(memory_list, cur_card_gray):
+    best_match_idx = -1
+    best_inliers = 0
+    best_angle = 0.0
+    
     orb = cv2.ORB_create(nfeatures=500)
-    kp1, des1 = orb.detectAndCompute(mem_card_gray, None)
     kp2, des2 = orb.detectAndCompute(cur_card_gray, None)
-    if des1 is None or des2 is None: return 0.0
+    if des2 is None: return -1, 0.0
 
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des1, des2)
-    if len(matches) < 10: return 0.0
+    
+    for i, mem_card in enumerate(memory_list):
+        kp1, des1 = orb.detectAndCompute(mem_card, None)
+        if des1 is None: continue
         
-    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-    M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts)
-    if M is None: return 0.0
+        matches = bf.match(des1, des2)
+        if len(matches) < 10: continue
+            
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts)
         
-    angle_rad = math.atan2(M[1, 0], M[0, 0])
-    return (math.degrees(angle_rad) % 360)
+        if M is not None and inliers is not None:
+            inlier_count = len(inliers)
+            # If this memory has the most matching dots, it's our card!
+            if inlier_count > best_inliers:
+                best_inliers = inlier_count
+                best_match_idx = i
+                angle_rad = math.atan2(M[1, 0], M[0, 0])
+                best_angle = (math.degrees(angle_rad) % 360)
 
+    return best_match_idx, best_angle
 
 # --- ROS 2 NODE ---
 class CardMemoryNode(Node):
@@ -73,33 +88,28 @@ class CardMemoryNode(Node):
         super().__init__('card_memory_node')
         self.bridge = CvBridge()
         
-        # Memory variables
         self.memory_state_gray = []
         self.memory_identities = []
+        self.tested_cards = 0
+        
         self.current_cards_gray = []
         self.current_cards_bgr = []
-        self.flipped_card_index = -1
         
-        # Subscribers and Publishers
         self.image_sub = self.create_subscription(Image, '/image_raw', self.image_callback, qos_profile_sensor_data)
-        self.vel_pub = self.create_publisher(Twist, '/cmd_vel', 10) # Publishes wheel commands
         
-        # State Machine Variables
-        self.state = "WAITING"
+        # New Sequential State Machine
+        self.state = "LEARNING"
         self.state_start_time = time.time()
         self.stable_frames = 0
-        self.target_cards = 5
+        self.empty_frames = 0
         
-        # --- TUNING VARIABLES ---
-        self.turn_speed = 0.5      
-        self.turn_away_duration = 6.6  # Shaving off another quarter-second!
-        self.turn_back_duration = 6.28 
-        self.hide_duration = 5.0
-        
-        # Control Loop Timer (Runs 10 times a second)
+        # --- NEW DISPLAY VARIABLES ---
+        self.display_text = "Analyzing..."
+        self.display_color = (255, 255, 0) # Default to Cyan
+        # -----------------------------
+
         self.timer = self.create_timer(0.1, self.control_loop)
-        
-        self.get_logger().info("Autonomous Mode Started! Place 5 cards in front of the bot.")
+        self.get_logger().info("Sequential Mode Started! Show me Card 1.")
 
     def change_state(self, new_state):
         self.state = new_state
@@ -107,80 +117,95 @@ class CardMemoryNode(Node):
         self.get_logger().info(f"--- STATE CHANGE -> {new_state} ---")
 
     def control_loop(self):
-        """The internal brain clock that manages the state machine."""
         elapsed = time.time() - self.state_start_time
-        vel_cmd = Twist()
 
-        if self.state == "WAITING":
-            # Wait for 5 cards to be stable for at least 15 frames (~1.5 seconds)
-            if len(self.current_cards_gray) == self.target_cards:
+        # PHASE 1: Scan exactly 1 card
+        if self.state == "LEARNING":
+            if len(self.current_cards_gray) == 1:
                 self.stable_frames += 1
+                if self.stable_frames >= 15: # Waited long enough to focus
+                    card_gray = self.current_cards_gray[0]
+                    card_bgr = self.current_cards_bgr[0]
+                    
+                    self.memory_state_gray.append(card_gray)
+                    identity = read_card_identity(card_bgr)
+                    self.memory_identities.append(identity)
+                    
+                    self.get_logger().info(f"SAVED: {identity} as Card {len(self.memory_state_gray)}")
+                    self.stable_frames = 0
+                    
+                    if len(self.memory_state_gray) == 5:
+                        self.change_state("BREAK")
+                    else:
+                        self.get_logger().info("Please REMOVE the card from the camera.")
+                        self.change_state("WAIT_FOR_EMPTY_LEARN")
             else:
                 self.stable_frames = 0
-                
-            if self.stable_frames >= 15:
-                self.change_state("SAVING")
 
-        elif self.state == "SAVING":
-            # Save the memory automatically
-            self.memory_state_gray = self.current_cards_gray.copy()
-            self.memory_identities = [read_card_identity(c) for c in self.current_cards_bgr]
-            self.get_logger().info("Memory locked! Turning away...")
-            self.change_state("TURNING_AWAY")
-
-        elif self.state == "TURNING_AWAY":
-            if elapsed < self.turn_away_duration: # <-- CHANGED THIS LINE
-                vel_cmd.angular.z = self.turn_speed 
+        # Wait for the human to pick the card up off the table
+        elif self.state == "WAIT_FOR_EMPTY_LEARN":
+            if len(self.current_cards_gray) == 0:
+                self.empty_frames += 1
+                if self.empty_frames >= 10:
+                    self.empty_frames = 0
+                    self.get_logger().info(f"Ready for Card {len(self.memory_state_gray) + 1}!")
+                    self.change_state("LEARNING")
             else:
-                self.change_state("HIDING")
-            self.vel_pub.publish(vel_cmd)
+                self.empty_frames = 0
 
-        elif self.state == "HIDING":
-            self.vel_pub.publish(Twist()) # Force stop
-            # Wait 5 seconds for human to flip a card
-            if elapsed >= self.hide_duration:
-                self.get_logger().info("Time is up! Turning back...")
-                self.change_state("TURNING_BACK")
+        # PHASE 2: Wait 5 seconds
+        elif self.state == "BREAK":
+            if elapsed >= 5.0:
+                self.get_logger().info("Break is over! Show me the cards one by one (any order!).")
+                self.change_state("TESTING")
 
-        elif self.state == "TURNING_BACK":
-            if elapsed < self.turn_back_duration: # <-- CHANGED THIS LINE
-                vel_cmd.angular.z = -self.turn_speed 
+        # PHASE 3: Show cards to check for flips
+        elif self.state == "TESTING":
+            if len(self.current_cards_gray) == 1:
+                self.stable_frames += 1
+                if self.stable_frames >= 15:
+                    cur_gray = self.current_cards_gray[0]
+                    
+                    # Search the memory bank!
+                    match_idx, angle = find_best_match_and_angle(self.memory_state_gray, cur_gray)
+                    
+                    if match_idx != -1:
+                        identity = self.memory_identities[match_idx]
+                        if 140 < angle < 220:
+                            self.get_logger().info(f"RESULTS: That is {identity} (Original Card {match_idx+1}) AND IT IS FLIPPED!")
+                            # NEW: Make it Red and shout Flipped!
+                            self.display_text = f"FLIPPED: {identity}"
+                            self.display_color = (0, 0, 255) 
+                        else:
+                            self.get_logger().info(f"RESULTS: That is {identity} (Original Card {match_idx+1}) (Untouched).")
+                            # NEW: Keep it Cyan and say OK
+                            self.display_text = f"OK: {identity}"
+                            self.display_color = (255, 255, 0) 
+                    else:
+                        self.get_logger().warn("I don't remember this card at all!")
+                        self.display_text = "UNKNOWN CARD"
+                        self.display_color = (0, 165, 255) # Orange
+
+                    self.tested_cards += 1
+                    self.stable_frames = 0
+                    
+                    if self.tested_cards == 5:
+                        self.change_state("FINISHED")
+                    else:
+                        self.get_logger().info("Please REMOVE the card from the camera.")
+                        self.change_state("WAIT_FOR_EMPTY_TEST")
             else:
                 self.stable_frames = 0
-                self.change_state("SETTLING")
-            self.vel_pub.publish(vel_cmd)
 
-        elif self.state == "SETTLING":
-            self.vel_pub.publish(Twist()) # Force stop
-            # Wait until it clearly sees 5 cards again
-            if len(self.current_cards_gray) == self.target_cards:
-                self.stable_frames += 1
-            if self.stable_frames >= 15:
-                self.change_state("COMPARING")
-            # Failsafe: If it doesn't see 5 cards after 10 seconds, complain.
-            elif elapsed > 10.0:
-                self.get_logger().warn("I don't see 5 cards anymore! Move them back into view!")
-
-        elif self.state == "COMPARING":
-            self.get_logger().info("[RESULTS]:")
-            self.flipped_card_index = -1 # Reset before checking
-            
-            for i in range(len(self.memory_state_gray)):
-                mem_gray = self.memory_state_gray[i]
-                cur_gray = self.current_cards_gray[i]
-                identity = self.memory_identities[i]
-                angle = check_flip_angle(mem_gray, cur_gray)
-                
-                if 140 < angle < 220:
-                    self.get_logger().info(f" -> {identity} (Card {i+1}) was FLIPPED!")
-                    self.flipped_card_index = i  # <--- NEW: Save the winning card number!
-                else:
-                    self.get_logger().info(f" -> {identity} (Card {i+1}) is untouched.")
-            self.change_state("FINISHED")
-            
-        elif self.state == "FINISHED":
-            # Do nothing, game is over!
-            pass
+        elif self.state == "WAIT_FOR_EMPTY_TEST":
+            if len(self.current_cards_gray) == 0:
+                self.empty_frames += 1
+                if self.empty_frames >= 10:
+                    self.empty_frames = 0
+                    self.display_text = "Analyzing..." # <--- NEW: Reset text for next card
+                    self.display_color = (255, 255, 0) # <--- NEW: Reset color for next card
+            else:
+                self.empty_frames = 0
 
     def image_callback(self, msg):
         try:
@@ -195,24 +220,24 @@ class CardMemoryNode(Node):
 
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         card_contours = [cv2.approxPolyDP(c, 0.04 * cv2.arcLength(c, True), True) 
-                         for c in contours if cv2.contourArea(c) > 1500]
+                         for c in contours if 1500 < cv2.contourArea(c) < 40000]
         card_contours = [c for c in card_contours if len(c) == 4]
         
         card_contours = sorted(card_contours, key=lambda c: cv2.boundingRect(c)[0])
         
         temp_gray_cards = []
         temp_bgr_cards = []
-        card_count = len(card_contours)
         
         for i, approx in enumerate(card_contours):
-            # Default to Green for all cards
-            box_color = (0, 255, 0)
-            
-            # NEW: If the game is over and this is the flipped card, make it RED!
-            if self.state in ["COMPARING", "FINISHED"] and i == self.flipped_card_index:
-                box_color = (0, 0, 255) # Red in BGR
+            # Dynamic colors based on what the bot is doing
+            if self.state in ["LEARNING", "WAIT_FOR_EMPTY_LEARN"]:
+                box_color = (0, 255, 0) # Green
+                text_to_show = "Scanning..."
+            else:
+                # Use the variables we set during the Testing phase!
+                box_color = self.display_color
+                text_to_show = self.display_text
                 
-            # Draw the box using our chosen color
             cv2.drawContours(frame, [approx], -1, box_color, 3)
             pts = approx.reshape(4, 2)
             
@@ -220,17 +245,18 @@ class CardMemoryNode(Node):
             temp_bgr_cards.append(get_warped_card(frame, pts))
             
             x, y, w, h = cv2.boundingRect(approx)
-            cv2.putText(frame, f"Card {i+1}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
-
+            cv2.putText(frame, text_to_show, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
+            
         self.current_cards_gray = temp_gray_cards
         self.current_cards_bgr = temp_bgr_cards
         
-        # Display the State Machine status on screen
-        cv2.putText(frame, f"State: {self.state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 3)
-        cv2.putText(frame, f"Cards Seen: {card_count}/5", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        cv2.putText(frame, f"State: {self.state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3)
+        cv2.putText(frame, f"Cards Memorized: {len(self.memory_state_gray)}/5", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        if self.state in ["TESTING", "WAIT_FOR_EMPTY_TEST", "FINISHED"]:
+            cv2.putText(frame, f"Cards Tested: {self.tested_cards}/5", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
         display_frame = cv2.resize(frame, (640, 480))
-        cv2.imshow("TurtleBot3 Autonomous Vision", display_frame)
+        cv2.imshow("TurtleBot3 Magic Scanner", display_frame)
         cv2.waitKey(1)
 
 def main(args=None):
@@ -241,7 +267,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.vel_pub.publish(Twist()) # Send a stop command just in case!
         cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
